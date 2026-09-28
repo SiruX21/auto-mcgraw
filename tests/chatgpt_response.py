@@ -41,7 +41,7 @@ with sync_playwright() as p:
         assert page.evaluate('text=>parseAnswerJSON(text)', json.dumps({'answer': value})) == {'answer': value}
     print('PASS: surrounding prose, braces in strings, false/zero answers; malformed JSON rejected')
 
-    page.evaluate('messagesAtQuestion=new Set(getAssistantMessages().map(getMessageIdentity)); startObserving()')
+    page.evaluate('activeRequestId="question-123"; messagesAtQuestion=new Set(getAssistantMessages().map(getMessageIdentity)); startObserving()')
     page.wait_for_timeout(600)
     assert page.evaluate('deliveries.length') == 0
     page.evaluate("""() => {
@@ -58,6 +58,7 @@ with sync_playwright() as p:
     page.evaluate('document.querySelector("button").remove()')
     page.wait_for_function('deliveries.length===1')
     assert json.loads(page.evaluate('deliveries[0].response')) == answer
+    assert page.evaluate('deliveries[0].requestId') == 'question-123'
     page.evaluate('document.body.append(document.createElement("div"))')
     page.wait_for_timeout(600)
     assert page.evaluate('deliveries.length') == 1

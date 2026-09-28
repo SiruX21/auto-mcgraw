@@ -172,6 +172,7 @@ async function processQuestion(message) {
     const response = await sendMessageWithRetry(aiTabId, {
       type: "receiveQuestion",
       question: message.question,
+      requestId: message.requestId,
     });
     if (!response || response.received !== true) {
       throw new Error(response?.error || "The AI tab did not accept the question.");
@@ -205,6 +206,7 @@ async function processResponse(message) {
       await sendMessageWithRetry(duplicateTabId, {
         type: "processChatGPTResponse",
         response: message.response,
+        requestId: message.requestId,
         isDuplicateTab: true,
       });
       return;
@@ -215,6 +217,7 @@ async function processResponse(message) {
       await sendMessageWithRetry(originalTabId, {
         type: "processChatGPTResponse",
         response: message.response,
+        requestId: message.requestId,
         isDuplicateTab: false,
       });
       return;
@@ -245,6 +248,7 @@ async function processResponse(message) {
     await sendMessageWithRetry(mheTabId, {
       type: "processChatGPTResponse",
       response: message.response,
+      requestId: message.requestId,
     });
   } catch (error) {
     console.error("Error processing AI response:", error);

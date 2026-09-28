@@ -8,6 +8,7 @@ let pauseBeforeSubmit = false;
 let waitingForDuplicateCompletion = false;
 let currentResponse = null;
 let matchingPauseIntervalId = null;
+let pendingQuestion = null;
 const LOG_PREFIX = "[Auto-McGraw][mhe]";
 
 chrome.storage.sync.get(["doubleCreditMode", "randomConfidence", "pauseBeforeSubmit"], function (data) {
@@ -62,7 +63,7 @@ function setupMessageListener() {
         currentResponse = message.response;
         processDoubleCreditResponse(message.response);
       } else {
-        void processChatGPTResponse(message.response).catch((error) => {
+        void processChatGPTResponse(message.response, message.requestId).catch((error) => {
           handleProcessResponseError(error);
         });
       }
@@ -90,6 +91,7 @@ function setupMessageListener() {
 
     if (message.type === "stopAutomation") {
       isAutomating = false;
+      pendingQuestion = null;
       clearMatchingPauseWatcher();
       updateButtonState();
       sendResponse({ received: true });
@@ -122,6 +124,7 @@ function updateButtonState() {
 function handleProcessResponseError(error) {
   console.error("Error processing response:", error);
   isAutomating = false;
+  pendingQuestion = null;
   waitingForDuplicateCompletion = false;
   clearMatchingPauseWatcher();
   updateButtonState();
@@ -211,6 +214,7 @@ function processDuplicateTabAnswering(responseText) {
 
 function completeDoubleCreditFlow() {
   waitingForDuplicateCompletion = false;
+  pendingQuestion = null;
 
   const container = document.querySelector(".probe-container");
   if (!container) return;
@@ -246,7 +250,7 @@ function completeDoubleCreditFlow() {
 }
 
 function fillInAnswers(answers, container) {
-
+  let filled = 0;
   if (container.querySelector(".awd-probe-type-fill_in_the_blank")) {
     const inputs = container.querySelectorAll("input.fitb-input");
 
@@ -254,6 +258,7 @@ function fillInAnswers(answers, container) {
       if (answers[index]) {
         input.value = answers[index];
         input.dispatchEvent(new Event("input", { bubbles: true }));
+        filled++;
       }
     });
   } else {
@@ -284,12 +289,14 @@ function fillInAnswers(answers, container) {
           });
 
           if (shouldBeSelected) {
-            choice.click();
+            if (!choice.checked) choice.click();
+            filled++;
           }
         }
       }
     });
   }
+  return filled;
 }
 
 function checkForCorrectAnswer(container) {
@@ -360,6 +367,51 @@ function getQuestionSignature(container) {
   return `${questionType}::${normalizeChoiceText(promptText)}`;
 }
 
+function getQuestionIdentity(container = document.querySelector(".probe-container")) {
+  if (!container) return "";
+  return container.querySelector("[data-probe-id]")?.getAttribute("data-probe-id") ||
+    getQuestionSignature(container);
+}
+
+function isQuestionFeedback(container) {
+  return !!container?.querySelector(".awd-probe-correctness, .answer-container");
+}
+
+async function waitForQuestionTransition(question, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAutomating || pendingQuestion !== question) return false;
+    const container = document.querySelector(".probe-container");
+    if (container && getQuestionIdentity(container) !== question.identity &&
+        !isQuestionFeedback(container)) return true;
+    // Reading and topic-overview screens are handled by checkForNextStep.
+    if (document.querySelector(".forced-learning .alert-error, awd-topic-overview-button-bar")) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("McGraw Hill did not finish loading the next question. Automation paused.");
+}
+
+async function waitForQuestionControl(selector, question, timeout = 10000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!isAutomating || pendingQuestion !== question ||
+        getQuestionIdentity() !== question.identity) return null;
+    const element = document.querySelector(selector);
+    if (element && element.getClientRects().length && !element.disabled) return element;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("McGraw Hill control did not become ready: " + selector);
+}
+
+async function advancePastFeedback(request, container) {
+  const nextButton = await waitForQuestionControl(".next-button", request);
+  if (!nextButton) return false;
+  checkForCorrectAnswer(container);
+  nextButton.click();
+  console.info(LOG_PREFIX, "Waiting for next question", { requestId: request.requestId });
+  return await waitForQuestionTransition(request);
+}
+
 function pauseForManualMatchingAndResume(questionSignature) {
   if (!questionSignature) return;
 
@@ -425,7 +477,7 @@ function handleForcedLearning() {
 }
 
 function checkForNextStep() {
-  if (!isAutomating) return;
+  if (!isAutomating || pendingQuestion) return;
 
   if (handleTopicOverview()) {
     return;
@@ -436,12 +488,34 @@ function checkForNextStep() {
   }
 
   const container = document.querySelector(".probe-container");
-  if (container && !container.querySelector(".forced-learning")) {
+  if (isQuestionFeedback(container)) {
+    const request = { identity: getQuestionIdentity(container), processing: true };
+    pendingQuestion = request;
+    void advancePastFeedback(request, container).then((advanced) => {
+      if (pendingQuestion !== request) return;
+      pendingQuestion = null;
+      if (advanced && isAutomating) checkForNextStep();
+    }).catch((error) => {
+      if (pendingQuestion === request) handleProcessResponseError(error);
+    });
+    return;
+  }
+  if (container && !container.querySelector(".forced-learning") && !isQuestionFeedback(container)) {
     const qData = parseQuestion();
     if (qData) {
+      const request = {
+        identity: getQuestionIdentity(container),
+        requestId: crypto.randomUUID(),
+        processing: false,
+      };
+      pendingQuestion = request;
+      console.info(LOG_PREFIX, "Sending question", { requestId: request.requestId, probeId: request.identity });
       chrome.runtime.sendMessage({
         type: "sendQuestionToChatGPT",
         question: qData,
+        requestId: request.requestId,
+      }).catch((error) => {
+        if (pendingQuestion === request) handleProcessResponseError(error);
       });
     }
   }
@@ -1554,7 +1628,34 @@ function normalizeResponseAnswers(rawAnswer, questionType, container) {
   return dedupeAnswers(flattenedAnswers);
 }
 
-async function processChatGPTResponse(responseText) {
+async function processChatGPTResponse(responseText, requestId) {
+  const request = pendingQuestion;
+  if (!isAutomating || !request || request.processing ||
+      (requestId && requestId !== request.requestId)) {
+    console.info(LOG_PREFIX, "Ignoring duplicate or cancelled response", { requestId });
+    return;
+  }
+  if (getQuestionIdentity() !== request.identity ||
+      isQuestionFeedback(document.querySelector(".probe-container"))) {
+    console.warn(LOG_PREFIX, "Ignoring answer for a question that is no longer active", { requestId });
+    pendingQuestion = null;
+    checkForNextStep();
+    return;
+  }
+  request.processing = true;
+  console.info(LOG_PREFIX, "Applying response to its question", { requestId: request.requestId, probeId: request.identity });
+  let advanced = false;
+  try {
+    advanced = await applyChatGPTResponse(responseText, request);
+  } catch (error) {
+    if (pendingQuestion === request) throw error;
+  } finally {
+    if (pendingQuestion === request) pendingQuestion = null;
+  }
+  if (isAutomating && (advanced || getQuestionIdentity() !== request.identity)) checkForNextStep();
+}
+
+async function applyChatGPTResponse(responseText, request) {
   if (handleTopicOverview()) {
     return;
   }
@@ -1610,58 +1711,21 @@ async function processChatGPTResponse(responseText) {
       }
     });
   } else {
-    fillInAnswers(answers, container);
-  }
-
-  if (isAutomating) {
-    if (pauseBeforeSubmit) {
-      waitForElement(".next-button", 120000)
-        .then((nextButton) => {
-          const observer = new MutationObserver(() => {
-            if (nextButton.offsetParent === null) {
-              observer.disconnect();
-              setTimeout(() => {
-                checkForNextStep();
-              }, 1000);
-            }
-          });
-          observer.observe(document.body, { childList: true, subtree: true });
-        })
-        .catch(() => {});
-    } else {
-      waitForElement(
-        getConfidenceSelector(),
-        10000
-      )
-        .then((button) => {
-          button.click();
-
-          setTimeout(() => {
-            checkForCorrectAnswer(container);
-
-            waitForElement(".next-button", 10000)
-              .then((nextButton) => {
-                nextButton.click();
-                setTimeout(() => {
-                  checkForNextStep();
-                }, 1000);
-              })
-              .catch((error) => {
-                console.error("Automation error:", error);
-                isAutomating = false;
-                clearMatchingPauseWatcher();
-                updateButtonState();
-              });
-          }, 1000);
-        })
-        .catch((error) => {
-          console.error("Automation error:", error);
-          isAutomating = false;
-          clearMatchingPauseWatcher();
-          updateButtonState();
-        });
+    if (!fillInAnswers(answers, container)) {
+      throw new Error("The AI answer did not match any input on the active question. Automation paused.");
     }
   }
+
+  if (!isAutomating) return false;
+  if (pauseBeforeSubmit) {
+    return await waitForQuestionTransition(request, 120000);
+  }
+
+  const button = await waitForQuestionControl(getConfidenceSelector(), request);
+  if (!button) return false;
+  button.click();
+  // Do not parse the submitted question/feedback while the next page loads.
+  return await advancePastFeedback(request, container);
 }
 
 function addAssistantButton() {
@@ -1689,6 +1753,7 @@ function addAssistantButton() {
       btn.addEventListener("click", () => {
         if (isAutomating) {
           isAutomating = false;
+          pendingQuestion = null;
           waitingForDuplicateCompletion = false;
           clearMatchingPauseWatcher();
           chrome.runtime.sendMessage({ type: "resetTabTracking" });
@@ -1702,6 +1767,7 @@ function addAssistantButton() {
           );
           if (proceed) {
             isAutomating = true;
+            pendingQuestion = null;
             clearMatchingPauseWatcher();
             btn.textContent = "Stop Automation";
             checkForNextStep();
@@ -1809,6 +1875,7 @@ function parseQuestion() {
       .filter(Boolean);
   } else if (questionType !== "fill_in_the_blank") {
     container.querySelectorAll(".choiceText").forEach((el) => {
+      if (el.closest(".answer-container")) return;
       options.push(el.textContent.trim());
     });
   }

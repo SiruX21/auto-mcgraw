@@ -1,5 +1,6 @@
 let hasResponded = false;
 let messagesAtQuestion = new Set();
+let activeRequestId = null;
 let observationStartTime = 0;
 let observationTimeout = null;
 let observationInterval = null;
@@ -12,6 +13,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "receiveQuestion") {
     resetObservation();
+    activeRequestId = message.requestId || null;
 
     messagesAtQuestion = new Set(getAssistantMessages().map(getMessageIdentity));
     hasResponded = false;
@@ -251,6 +253,7 @@ function startObserving() {
     chrome.runtime.sendMessage({
       type: "chatGPTResponse",
       response: JSON.stringify(parsed),
+      requestId: activeRequestId,
     }).then(() => {
       resetObservation();
     }).catch((error) => {
