@@ -2,6 +2,7 @@ let hasResponded = false;
 let messageCountAtQuestion = 0;
 let observationStartTime = 0;
 let observationTimeout = null;
+let observationInterval = null;
 let observer = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -12,9 +13,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "receiveQuestion") {
     resetObservation();
 
-    const messages = document.querySelectorAll(
-      '[data-message-author-role="assistant"]'
-    );
+    const messages = getAssistantMessages();
     messageCountAtQuestion = messages.length;
     hasResponded = false;
 
@@ -32,6 +31,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 function resetObservation() {
   hasResponded = false;
+  if (observationInterval) {
+    clearInterval(observationInterval);
+    observationInterval = null;
+  }
   if (observationTimeout) {
     clearTimeout(observationTimeout);
     observationTimeout = null;
@@ -147,87 +150,106 @@ async function waitForComposerElement(findElement, errorMessage, timeout = 15000
   throw new Error(errorMessage);
 }
 
+// ChatGPT uses either the legacy author-role container or markdown roots
+// inside a selection-message container. Count each message only once.
+function getAssistantMessages() {
+  const roots = document.querySelectorAll(
+    '[data-message-author-role="assistant"], [data-markdown-text-style="assistant-message"]'
+  );
+  return [...new Set(Array.from(roots, (root) =>
+    root.closest('[data-message-author-role="assistant"]') ||
+    root.closest('[data-chatgpt-selection-message-id]') || root
+  ))];
+}
+
+function parseAnswerJSON(text) {
+  // Find complete JSON objects without confusing braces in quoted strings
+  // or explanatory text around the object with the response itself.
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (start < 0) {
+      if (char !== "{") continue;
+      start = i;
+      depth = 1;
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '\"') inString = false;
+      continue;
+    }
+    if (char === '\"') inString = true;
+    else if (char === "{") depth++;
+    else if (char === "}" && --depth === 0) {
+      try {
+        const parsed = JSON.parse(text.slice(start, i + 1));
+        if (Object.prototype.hasOwnProperty.call(parsed, "answer")) return parsed;
+      } catch (error) {
+        // Incomplete or invalid JSON must never be forwarded to McGraw Hill.
+      }
+      start = -1;
+    }
+  }
+  return null;
+}
+
+function extractAnswer(message) {
+  // Syntax highlighting splits text across spans and may omit language-json.
+  // textContent reassembles the source without visual wrapping or UI labels.
+  for (const code of message.querySelectorAll("pre code")) {
+    const parsed = parseAnswerJSON(code.textContent);
+    if (parsed) return parsed;
+  }
+  return parseAnswerJSON(message.textContent);
+}
+
 function startObserving() {
   observationStartTime = Date.now();
   observationTimeout = setTimeout(() => {
     if (!hasResponded) {
+      console.error("[Auto-McGraw] Timed out waiting for a valid ChatGPT JSON answer.");
       resetObservation();
     }
   }, 180000);
 
-  observer = new MutationObserver((mutations) => {
+  const checkResponse = () => {
     if (hasResponded) return;
-
-    const messages = document.querySelectorAll(
-      '[data-message-author-role="assistant"]'
-    );
-    if (!messages.length) return;
-
+    const messages = getAssistantMessages();
     if (messages.length <= messageCountAtQuestion) return;
-
     const latestMessage = messages[messages.length - 1];
-    const codeBlocks = latestMessage.querySelectorAll("pre code");
-    let responseText = "";
+    const generating = document.querySelector(
+      '[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop generating"], button[aria-label="Stop streaming"]'
+    );
+    if (generating || latestMessage.matches('[data-is-streaming="true"]') ||
+        latestMessage.querySelector('.result-streaming, [data-is-streaming="true"]')) return;
 
-    for (const block of codeBlocks) {
-      if (block.className.includes("language-json")) {
-        responseText = block.textContent.trim();
-        break;
-      }
-    }
+    const parsed = extractAnswer(latestMessage);
+    if (!parsed) return;
+    hasResponded = true;
+    chrome.runtime.sendMessage({
+      type: "chatGPTResponse",
+      response: JSON.stringify(parsed),
+    }).then(() => {
+      resetObservation();
+    }).catch((error) => {
+      console.error("[Auto-McGraw] Error sending response:", error);
+      resetObservation();
+    });
+  };
 
-    if (!responseText) {
-      responseText = latestMessage.textContent.trim();
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) responseText = jsonMatch[0];
-    }
-
-    responseText = responseText
-      .replace(/[\u200B-\u200D\uFEFF]/g, "")
-      .replace(/\n\s*/g, " ")
-      .trim();
-
-    try {
-      const parsed = JSON.parse(responseText);
-      if (parsed.answer && !hasResponded) {
-        hasResponded = true;
-        chrome.runtime
-          .sendMessage({
-            type: "chatGPTResponse",
-            response: responseText,
-          })
-          .then(() => {
-            resetObservation();
-          })
-          .catch((error) => {
-            console.error("Error sending response:", error);
-          });
-      }
-    } catch (e) {
-      const isGenerating = latestMessage.querySelector(".result-streaming");
-      if (!isGenerating && Date.now() - observationStartTime > 30000) {
-        const responseText = latestMessage.textContent.trim();
-        try {
-          const jsonPattern =
-            /\{[\s\S]*?"answer"[\s\S]*?"explanation"[\s\S]*?\}/;
-          const jsonMatch = responseText.match(jsonPattern);
-
-          if (jsonMatch && !hasResponded) {
-            hasResponded = true;
-            chrome.runtime.sendMessage({
-              type: "chatGPTResponse",
-              response: jsonMatch[0],
-            });
-            resetObservation();
-          }
-        } catch (e) {}
-      }
-    }
-  });
-
+  observer = new MutationObserver(checkResponse);
   observer.observe(document.body, {
     childList: true,
     subtree: true,
     characterData: true,
+    attributes: true,
+    attributeFilter: ["data-is-streaming", "aria-label", "data-testid"],
   });
+  // Completion can change without any further response-text mutations.
+  observationInterval = setInterval(checkResponse, 500);
 }
