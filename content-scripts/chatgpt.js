@@ -78,31 +78,69 @@ async function insertQuestion(questionData) {
     '\n\nIMPORTANT: Your answer should be in a JSON code block.' +
     '\n\nPlease provide your answer in JSON format with keys "answer" and "explanation". Explanations should be no more than one sentence. DO NOT acknowledge the correction in your response, only answer the new question.';
 
-  return new Promise((resolve, reject) => {
-    const inputArea = document.getElementById("prompt-textarea");
-    if (inputArea) {
-      setTimeout(() => {
-        inputArea.focus();
-        inputArea.innerHTML = `<p>${text}</p>`;
-        inputArea.dispatchEvent(new Event("input", { bubbles: true }));
+  const inputArea = await waitForComposerElement(
+    () => Array.from(document.querySelectorAll(
+      '#prompt-textarea, [contenteditable="true"][data-placeholder], textarea[name="prompt-textarea"]'
+    )).find((element) =>
+      isComposerElementReady(element) &&
+      (element.isContentEditable || element.tagName === "TEXTAREA") &&
+      !element.readOnly
+    ),
+    "ChatGPT input is unavailable. Open a chat and wait for it to finish loading."
+  );
 
-        setTimeout(() => {
-          const sendButton = document.querySelector(
-            '[data-testid="send-button"]'
-          );
-          if (sendButton) {
-            sendButton.click();
-            startObserving();
-            resolve();
-          } else {
-            reject(new Error("Send button not found"));
-          }
-        }, 300);
-      }, 300);
-    } else {
-      reject(new Error("Input area not found"));
+  inputArea.focus();
+  if (inputArea.tagName === "TEXTAREA") {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype, "value"
+    ).set;
+    setter.call(inputArea, text);
+    inputArea.dispatchEvent(new Event("input", { bubbles: true }));
+  } else {
+    // Use the browser's editing transaction so rich-text editors update their
+    // internal state. Assigning innerHTML only changes their rendered DOM.
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(inputArea);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    if (!document.execCommand("insertText", false, text)) {
+      throw new Error("ChatGPT rejected text entry. Refresh the ChatGPT tab and try again.");
     }
-  });
+  }
+
+  const sendButton = await waitForComposerElement(
+    () => {
+      if (!inputArea.isConnected) return null;
+      const composer = inputArea.closest("form") || document;
+      return Array.from(composer.querySelectorAll(
+        '[data-testid="send-button"], button#composer-submit-button, button[aria-label="Send prompt"], button[aria-label="Send message"]'
+      )).find((button) =>
+        isComposerElementReady(button) &&
+        button.getAttribute("data-testid") !== "stop-button" &&
+        !/stop/i.test(button.getAttribute("aria-label") || "")
+      );
+    },
+    "ChatGPT's send button did not become ready. Check the chat for a busy response or an error."
+  );
+  startObserving();
+  sendButton.click();
+}
+
+function isComposerElementReady(element) {
+  return element.getClientRects().length > 0 &&
+    getComputedStyle(element).visibility !== "hidden" &&
+    !element.disabled && element.getAttribute("aria-disabled") !== "true";
+}
+
+async function waitForComposerElement(findElement, errorMessage, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  do {
+    const element = findElement();
+    if (element) return element;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  throw new Error(errorMessage);
 }
 
 function startObserving() {

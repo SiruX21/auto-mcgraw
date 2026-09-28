@@ -149,10 +149,13 @@ async function processQuestion(message) {
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
 
-    await sendMessageWithRetry(aiTabId, {
+    const response = await sendMessageWithRetry(aiTabId, {
       type: "receiveQuestion",
       question: message.question,
     });
+    if (!response || response.received !== true) {
+      throw new Error(response?.error || "The AI tab did not accept the question.");
+    }
 
     if (sameWindow && lastActiveTabId && lastActiveTabId !== aiTabId) {
       setTimeout(async () => {
@@ -163,7 +166,7 @@ async function processQuestion(message) {
     if (mheTabId) {
       await sendMessageWithRetry(mheTabId, {
         type: "alertMessage",
-        message: `Error communicating with ${aiType}. Please make sure it's open in another tab.`,
+        message: `Error communicating with ${aiType}: ${error.message || String(error)} Please check the AI tab and try again.`,
       });
       await sendMessageWithRetry(mheTabId, {
         type: "stopAutomation",
