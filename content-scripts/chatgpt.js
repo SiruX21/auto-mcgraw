@@ -1,5 +1,5 @@
 let hasResponded = false;
-let messageCountAtQuestion = 0;
+let messagesAtQuestion = new Set();
 let observationStartTime = 0;
 let observationTimeout = null;
 let observationInterval = null;
@@ -13,8 +13,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "receiveQuestion") {
     resetObservation();
 
-    const messages = getAssistantMessages();
-    messageCountAtQuestion = messages.length;
+    messagesAtQuestion = new Set(getAssistantMessages().map(getMessageIdentity));
     hasResponded = false;
 
     insertQuestion(message.question)
@@ -162,6 +161,16 @@ function getAssistantMessages() {
   ))];
 }
 
+function getMessageIdentity(message) {
+  // ChatGPT virtualizes long conversations: new replies can replace old DOM
+  // entries without increasing the number of visible messages. IDs also
+  // survive React replacing a message's DOM node.
+  return message.getAttribute("data-message-id") ||
+    message.getAttribute("data-chatgpt-selection-message-id") ||
+    message.querySelector("[data-message-id]")?.getAttribute("data-message-id") ||
+    message;
+}
+
 function parseAnswerJSON(text) {
   // Find complete JSON objects without confusing braces in quoted strings
   // or explanatory text around the object with the response itself.
@@ -210,9 +219,15 @@ function extractAnswer(message) {
 
 function startObserving() {
   observationStartTime = Date.now();
+  console.info("[Auto-McGraw] Waiting for a new ChatGPT response", {
+    previousMessages: messagesAtQuestion.size,
+  });
   observationTimeout = setTimeout(() => {
     if (!hasResponded) {
-      console.error("[Auto-McGraw] Timed out waiting for a valid ChatGPT JSON answer.");
+      console.error("[Auto-McGraw] Timed out waiting for a valid ChatGPT JSON answer.", {
+        visibleMessages: getAssistantMessages().length,
+        previousMessages: messagesAtQuestion.size,
+      });
       resetObservation();
     }
   }, 180000);
@@ -220,8 +235,9 @@ function startObserving() {
   const checkResponse = () => {
     if (hasResponded) return;
     const messages = getAssistantMessages();
-    if (messages.length <= messageCountAtQuestion) return;
+    if (!messages.length) return;
     const latestMessage = messages[messages.length - 1];
+    if (messagesAtQuestion.has(getMessageIdentity(latestMessage))) return;
     const generating = document.querySelector(
       '[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop generating"], button[aria-label="Stop streaming"]'
     );
@@ -231,6 +247,7 @@ function startObserving() {
     const parsed = extractAnswer(latestMessage);
     if (!parsed) return;
     hasResponded = true;
+    console.info("[Auto-McGraw] Parsed new ChatGPT response; forwarding to McGraw Hill.");
     chrome.runtime.sendMessage({
       type: "chatGPTResponse",
       response: JSON.stringify(parsed),

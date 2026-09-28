@@ -41,7 +41,7 @@ with sync_playwright() as p:
         assert page.evaluate('text=>parseAnswerJSON(text)', json.dumps({'answer': value})) == {'answer': value}
     print('PASS: surrounding prose, braces in strings, false/zero answers; malformed JSON rejected')
 
-    page.evaluate('messageCountAtQuestion=getAssistantMessages().length; startObserving()')
+    page.evaluate('messagesAtQuestion=new Set(getAssistantMessages().map(getMessageIdentity)); startObserving()')
     page.wait_for_timeout(600)
     assert page.evaluate('deliveries.length') == 0
     page.evaluate("""() => {
@@ -62,4 +62,30 @@ with sync_playwright() as p:
     page.wait_for_timeout(600)
     assert page.evaluate('deliveries.length') == 1
     print('PASS: old answers ignored, partial/streaming responses withheld, completed answer delivered once')
+
+    # Reproduce the live failure: ChatGPT keeps only a window of messages in
+    # the DOM, so a new completed reply need not increase the visible count.
+    for remaining in [5, 2]:
+        page.evaluate("""() => {
+          resetObservation(); deliveries.length=0;
+          document.querySelector('main').innerHTML='';
+          for(let i=0;i<5;i++) document.querySelector('main').insertAdjacentHTML('beforeend',
+            `<div data-chatgpt-selection-message-id="old-${i}"><div data-markdown-text-style="assistant-message"><pre><code>{"answer":"old"}</code></pre></div></div>`);
+          messagesAtQuestion=new Set(getAssistantMessages().map(getMessageIdentity));
+          startObserving();
+          // A rerender of the old latest message must not look like a new answer.
+          const last=document.querySelector('main').lastElementChild;
+          last.replaceWith(last.cloneNode(true));
+        }""")
+        page.wait_for_timeout(600)
+        assert page.evaluate('deliveries.length') == 0
+        page.evaluate("""remaining => {
+          const main=document.querySelector('main');
+          while(main.children.length>=remaining) main.firstElementChild.remove();
+          main.insertAdjacentHTML('beforeend', '<div data-chatgpt-selection-message-id="fresh"><div data-markdown-text-style="assistant-message"><pre><code>{"answer":"new"}</code></pre></div></div>');
+        }""", remaining)
+        page.wait_for_function('deliveries.length===1')
+        assert json.loads(page.evaluate('deliveries[0].response')) == {'answer': 'new'}
+        assert page.evaluate('getAssistantMessages().length') == remaining
+    print('PASS: new reply detected with unchanged/decreased visible count; old rerenders ignored')
     browser.close()
