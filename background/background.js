@@ -119,6 +119,22 @@ async function shouldFocusTabs() {
   return mheWindowId === aiWindowId;
 }
 
+async function ensureChatGPTListener(tabId) {
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "ping" });
+  } catch (error) {
+    // Existing tabs may predate extension installation/reload. Only inject
+    // when no receiver exists; other errors must not trigger duplicate sends.
+    if (!/Receiving end does not exist/i.test(error.message || String(error))) {
+      throw error;
+    }
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content-scripts/chatgpt.js"],
+    });
+  }
+}
+
 async function processQuestion(message) {
   if (processingQuestion) return;
   processingQuestion = true;
@@ -147,6 +163,10 @@ async function processQuestion(message) {
     if (sameWindow) {
       await focusTab(aiTabId);
       await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+
+    if (aiType === "chatgpt") {
+      await ensureChatGPTListener(aiTabId);
     }
 
     const response = await sendMessageWithRetry(aiTabId, {

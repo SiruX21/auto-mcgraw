@@ -5,6 +5,10 @@ let observationTimeout = null;
 let observer = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "ping") {
+    sendResponse({ received: true });
+    return false;
+  }
   if (message.type === "receiveQuestion") {
     resetObservation();
 
@@ -80,7 +84,7 @@ async function insertQuestion(questionData) {
 
   const inputArea = await waitForComposerElement(
     () => Array.from(document.querySelectorAll(
-      '#prompt-textarea, [contenteditable="true"][data-placeholder], textarea[name="prompt-textarea"]'
+      '#prompt-textarea, [contenteditable="true"][data-composer-markdown], [contenteditable="true"].ProseMirror[role="textbox"], [contenteditable="true"][data-placeholder], textarea[name="prompt-textarea"]'
     )).find((element) =>
       isComposerElementReady(element) &&
       (element.isContentEditable || element.tagName === "TEXTAREA") &&
@@ -112,9 +116,9 @@ async function insertQuestion(questionData) {
   const sendButton = await waitForComposerElement(
     () => {
       if (!inputArea.isConnected) return null;
-      const composer = inputArea.closest("form") || document;
+      const composer = inputArea.closest("form, [data-composer-body]") || document;
       return Array.from(composer.querySelectorAll(
-        '[data-testid="send-button"], button#composer-submit-button, button[aria-label="Send prompt"], button[aria-label="Send message"]'
+        '[data-testid="send-button"], button#composer-submit-button, button[aria-label="Send prompt"], button[aria-label="Send message"], button[aria-label="Send"]'
       )).find((button) =>
         isComposerElementReady(button) &&
         button.getAttribute("data-testid") !== "stop-button" &&

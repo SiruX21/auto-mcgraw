@@ -31,10 +31,11 @@ with sync_playwright() as p:
     for editor in [
         '<div id="prompt-textarea" contenteditable="true"><p>Old draft</p></div>',
         '<textarea id="prompt-textarea">Old draft</textarea>',
+        '<div contenteditable="true" data-composer-markdown role="textbox" class="ProseMirror"><p data-placeholder="Ask ChatGPT">Old draft</p></div>',
     ]:
         setup(page, f'<form>{editor}<button type="button" id="composer-submit-button" disabled>Send</button></form>')
         page.evaluate("""() => {
-          const input = document.getElementById('prompt-textarea');
+          const input = document.querySelector('[contenteditable], textarea');
           const button = document.querySelector('button');
           input.addEventListener('input', () => {
             window.editorState = input.value ?? input.innerText;
@@ -53,7 +54,7 @@ with sync_playwright() as p:
         state = page.evaluate("editorState")
         assert 'Is <b>x</b> < y & z?' in state and 'Second line' in state, state
         assert 'Old draft' not in state
-        assert page.locator('#prompt-textarea b').count() == 0
+        assert page.locator('[contenteditable] b, textarea b').count() == 0
         print('PASS: editor state, literal text, draft replacement, delayed send:', editor.split('>')[0])
 
     setup(page, '<form id="composer"></form>')
@@ -66,6 +67,16 @@ with sync_playwright() as p:
     page.evaluate("insertQuestion({type: 'fill_in_the_blank', question: 'Hello'})")
     assert page.evaluate("sent")
     print('PASS: delayed composer and original send selector')
+
+    setup(page, '<button aria-label="Send" id="unrelated">Unrelated</button><div data-composer-body><div contenteditable="true" data-composer-markdown role="textbox" class="ProseMirror"><p data-placeholder="Ask ChatGPT"><br></p></div><button type="submit" aria-label="Send">Send</button></div>')
+    page.evaluate("""() => {
+      document.querySelector('[data-composer-body] button').onclick = () => { window.sent = true; };
+      document.getElementById('unrelated').onclick = () => { throw new Error('Wrong send button'); };
+    }""")
+    page.evaluate("insertQuestion({type: 'fill_in_the_blank', question: 'Hello'})")
+    assert page.evaluate('sent')
+    assert page.evaluate("() => { let reply; receiveMessage({type:'ping'}, {}, r => reply=r); return reply.received; }")
+    print('PASS: observed ChatGPT markup, scoped Send button, and listener ping')
 
     setup(page, '<div id="prompt-textarea" contenteditable="true"></div><button id="composer-submit-button" data-testid="stop-button" aria-label="Stop streaming">Stop</button>')
     page.evaluate("""() => {
@@ -81,5 +92,30 @@ with sync_playwright() as p:
     assert 'send button' in result['error']
     assert not page.evaluate('stopClicked')
     print('PASS: stop control excluded and timeout reported')
+
+    page.goto('about:blank')
+    page.evaluate("""() => {
+      const event = {addListener() {}};
+      window.injections = [];
+      window.chrome = {
+        runtime: {onMessage: event},
+        storage: {sync: {get: async () => ({aiModel:'chatgpt'})}},
+        tabs: {onActivated:event, onRemoved:event, query:async()=>[],
+          sendMessage:async()=>({received:true})},
+        scripting: {executeScript:async config=>injections.push(config)}
+      };
+    }""")
+    page.add_script_tag(content=(ROOT / 'background/background.js').read_text(encoding='utf-8'))
+    page.evaluate('ensureChatGPTListener(123)')
+    assert page.evaluate('injections.length') == 0
+    page.evaluate("""() => {chrome.tabs.sendMessage = async () => {
+      throw new Error('Could not establish connection. Receiving end does not exist.');
+    }}""")
+    page.evaluate('ensureChatGPTListener(123)')
+    assert page.evaluate('injections') == [{'target': {'tabId': 123}, 'files': ['content-scripts/chatgpt.js']}]
+    page.evaluate("""() => {chrome.tabs.sendMessage = async () => {throw new Error('Tab closed');}}""")
+    assert page.evaluate("ensureChatGPTListener(123).catch(e=>e.message)") == 'Tab closed'
+    assert page.evaluate('injections.length') == 1
+    print('PASS: missing listener recovered; existing listener and other errors do not reinject')
     assert not errors, errors
     browser.close()
